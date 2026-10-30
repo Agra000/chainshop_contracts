@@ -6,41 +6,41 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
+import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 
-/// @title ChainShopEscrow
-/// @notice Escrow B2B ChainShop di Sepolia memakai Mock USDT (tanpa nilai uang asli).
-///         - 1 order = 1 buyer + 1 seller, dicatat per `orderId` (bytes32 dari ID order di DB).
-///         - Buyer deposit: harga barang + ongkir + estimasi gas (±) untuk 2 transaksi seller
-///           (markShipped & markDelivered). Seluruh estimasi gas diberikan ke seller.
-///         - Invoice dicatat sebagai event `InvoiceRecorded` saat seller kirim barang.
-///         - Admin (= arbiter) memutuskan refund. Semua batas waktu ditegakkan di contract,
-///           sehingga fungsi auto* boleh dipanggil siapa saja (cron backend, buyer, seller).
-contract ChainShopEscrow is AccessControl, Pausable, ReentrancyGuard {
+/// @title ChainShopEscrow (v3, hemat gas)
+/// @notice Rekber B2B ChainShop di Sepolia memakai Mock USDT (tanpa nilai uang asli).
+///         Contract ini HANYA menangani aksi yang memindahkan uang + pencatatan invoice:
+///           deposit  -> markShipped (invoice onchain) -> release (ke seller) / refund (ke buyer)
+///         v3: buyer menerima barang cukup dengan TANDA TANGAN EIP-712 (gratis, tanpa gas);
+///         seller lalu mengklaim dana sendiri lewat releaseWithAcceptance (gas dibayar seller).
+///         Status lain (barang sampai, pengajuan refund, retur, timer 3 hari, batas 3x refund)
+///         dikelola backend (off-chain) supaya buyer, seller, dan admin tidak membayar gas berulang.
+///         Contract tetap menjamin: uang hanya bisa ke buyer/seller order tersebut, dengan jumlah tetap,
+///         dan hanya sekali (tidak bisa dicairkan dua kali).
+contract ChainShopEscrow is AccessControl, Pausable, ReentrancyGuard, EIP712 {
     using SafeERC20 for IERC20;
 
+    /// @notice admin = arbiter refund (approve refund barang tak sampai), atur parameter, pause
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+    /// @notice wallet backend (cron): auto release / auto refund sesuai timer off-chain
+    bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
 
-    uint8 public constant MAX_REFUND_REQUESTS = 3;
+    /// @notice struct EIP-712 yang ditandatangani buyer saat menerima barang
+    bytes32 public constant ACCEPTANCE_TYPEHASH =
+        keccak256("Acceptance(bytes32 orderId,address buyer,address seller,uint256 amount)");
+
     uint32 public constant MAX_ITEMS = 50;
-    uint64 public constant MAX_WINDOW = 30 days;
+    uint64 public constant MAX_WINDOW = 90 days;
 
     enum Status {
-        None, //            0 belum ada
-        Funded, //          1 buyer sudah deposit, menunggu seller kirim
-        Shipped, //         2 seller kirim + invoice tercatat
-        Delivered, //       3 seller tandai sampai, timer buyer berjalan
-        RefundRequested, // 4 buyer ajukan refund, menunggu admin
-        ReturnPending, //   5 refund disetujui, buyer wajib kirim retur
-        ReturnShipped, //   6 buyer sudah kirim retur
-        ReturnDelivered, // 7 retur sampai di seller, timer seller berjalan
-        Completed, //       8 dana ke seller
-        Refunded, //        9 harga barang + ongkir ke buyer, estimasi gas ke seller
-        Cancelled //       10 seller tolak / lewat batas kirim, semua dana ke buyer
-    }
-
-    enum CancelReason {
-        SellerRejected,
-        ShipDeadlinePassed
+        None, //      0 belum ada
+        Funded, //    1 buyer sudah deposit, menunggu seller kirim
+        Shipped, //   2 seller kirim + invoice tercatat
+        Completed, // 3 dana dilepas ke seller
+        Refunded, //  4 refund setelah dikirim: barang + ongkir ke buyer, estimasi gas ke seller
+        Cancelled //  5 batal sebelum dikirim: semua dana kembali ke buyer
     }
 
     struct Order {
@@ -48,15 +48,11 @@ contract ChainShopEscrow is AccessControl, Pausable, ReentrancyGuard {
         address seller;
         uint256 itemsTotal; // total harga barang (6 desimal)
         uint256 shippingFee; // ongkir (6 desimal)
-        uint256 gasFee; // estimasi gas untuk transaksi seller (6 desimal)
+        uint256 gasFee; // estimasi gas transaksi seller (markShipped + klaim dana), 6 desimal
         uint32 itemCount; // jumlah baris barang di invoice
         uint64 fundedAt;
+        uint64 shipDeadline; // batas seller kirim
         uint64 shippedAt;
-        uint64 deliveredAt;
-        uint64 deadline; // batas waktu tahap aktif (0 = tidak ada)
-        uint64 pausedRemaining; // sisa waktu buyer saat refund diajukan
-        uint8 refundCount;
-        bool refundFromShipped; // refund karena barang tak kunjung sampai
         Status status;
     }
 
@@ -69,21 +65,17 @@ contract ChainShopEscrow is AccessControl, Pausable, ReentrancyGuard {
     IERC20 public immutable token;
     mapping(bytes32 => Order) public orders;
 
-    // ===== batas waktu (bisa diatur admin, mis. dipersingkat untuk demo) =====
-    uint64 public sellerShipWindow = 3 days; //    deposit -> seller wajib ship
-    uint64 public buyerConfirmWindow = 3 days; //  delivered -> buyer terima / refund
-    uint64 public returnShipWindow = 3 days; //    refund disetujui -> buyer kirim retur
-    uint64 public returnConfirmWindow = 3 days; // retur sampai -> seller konfirmasi
-    uint64 public notDeliveredWindow = 7 days; //  shipped -> boleh refund jika belum sampai
+    /// @notice deposit -> batas seller kirim (lewat = buyer bisa tarik dana sendiri)
+    uint64 public sellerShipWindow = 3 days;
+    /// @notice pintu darurat: jika backend tidak memutuskan apa pun selama ini sejak dikirim, seller bisa klaim
+    uint64 public sellerClaimWindow = 30 days;
 
-    // ===== parameter estimasi gas =====
     // gasFee (mUSDT, 6 desimal) = (baseGasUnits + perItemGasUnits * itemCount) * gasPriceRefWei * musdtPerEth / 1e18
     uint256 public baseGasUnits;
     uint256 public perItemGasUnits;
     uint256 public gasPriceRefWei;
-    uint256 public musdtPerEth; // jumlah unit mUSDT (6 desimal) per 1 ETH, kurs fixed
+    uint256 public musdtPerEth; // unit mUSDT (6 desimal) per 1 ETH, kurs fixed
 
-    // ===== events =====
     event Deposited(
         bytes32 indexed orderId,
         address indexed buyer,
@@ -93,7 +85,7 @@ contract ChainShopEscrow is AccessControl, Pausable, ReentrancyGuard {
         uint256 gasFee,
         uint256 shipDeadline
     );
-    event OrderCancelled(bytes32 indexed orderId, CancelReason reason, uint256 refundedToBuyer);
+    event OrderCancelled(bytes32 indexed orderId, uint256 refundedToBuyer, address indexed by);
     event Shipped(bytes32 indexed orderId, uint256 shippedAt);
     event InvoiceRecorded(
         bytes32 indexed orderId,
@@ -110,21 +102,13 @@ contract ChainShopEscrow is AccessControl, Pausable, ReentrancyGuard {
         uint64 purchasedAt,
         uint64 shippedAt
     );
-    event Delivered(bytes32 indexed orderId, uint256 buyerDeadline);
-    event Completed(bytes32 indexed orderId, uint256 paidToSeller, bool automatic);
-    event RefundRequested(bytes32 indexed orderId, uint8 attempt, bool notDelivered);
-    event RefundRejected(bytes32 indexed orderId, uint256 resumedDeadline);
-    event RefundApproved(bytes32 indexed orderId, bool returnRequired, uint256 returnDeadline);
-    event ReturnShipped(bytes32 indexed orderId);
-    event ReturnDelivered(bytes32 indexed orderId, uint256 sellerDeadline);
-    event ReturnExpired(bytes32 indexed orderId);
-    event Refunded(bytes32 indexed orderId, uint256 toBuyer, uint256 toSeller, bool automatic);
+    event Released(bytes32 indexed orderId, uint256 paidToSeller, address indexed by);
+    event Refunded(bytes32 indexed orderId, uint256 toBuyer, uint256 toSeller, address indexed by);
     event GasParamsUpdated(uint256 baseGasUnits, uint256 perItemGasUnits, uint256 gasPriceRefWei, uint256 musdtPerEth);
-    event WindowsUpdated(uint64 sellerShip, uint64 buyerConfirm, uint64 returnShip, uint64 returnConfirm, uint64 notDelivered);
+    event WindowsUpdated(uint64 sellerShipWindow, uint64 sellerClaimWindow);
 
-    // ===== errors =====
     error InvalidStatus(Status current);
-    error NotBuyer();
+    error NotAllowed();
     error NotSeller();
     error OrderExists();
     error InvalidInput();
@@ -132,26 +116,29 @@ contract ChainShopEscrow is AccessControl, Pausable, ReentrancyGuard {
     error DeadlineNotPassed();
     error GasFeeTooHigh(uint256 gasFee, uint256 maxGasFee);
     error InvoiceMismatch();
-    error RefundLimitReached();
-    error RefundNotAllowedYet(uint256 availableAt);
+    error InvalidSignature();
 
     constructor(
         address token_,
         address admin_,
+        address operator_,
         uint256 baseGasUnits_,
         uint256 perItemGasUnits_,
         uint256 gasPriceRefWei_,
         uint256 musdtPerEth_
-    ) {
+    ) EIP712("ChainShopEscrow", "1") {
         if (token_ == address(0) || admin_ == address(0)) revert InvalidInput();
         token = IERC20(token_);
-        // admin_ = wallet arbiter; deployer juga diberi role supaya bisa menjalankan scripts/admin-tools.js
+
         _grantRole(DEFAULT_ADMIN_ROLE, admin_);
         _grantRole(ADMIN_ROLE, admin_);
+        // deployer juga admin supaya bisa menjalankan scripts/admin-tools.js
         if (msg.sender != admin_) {
             _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
             _grantRole(ADMIN_ROLE, msg.sender);
         }
+        if (operator_ != address(0)) _grantRole(OPERATOR_ROLE, operator_);
+
         _setGasParams(baseGasUnits_, perItemGasUnits_, gasPriceRefWei_, musdtPerEth_);
     }
 
@@ -159,15 +146,15 @@ contract ChainShopEscrow is AccessControl, Pausable, ReentrancyGuard {
     // Buyer: deposit
     // =====================================================================
 
-    /// @notice estimasi gas (dalam mUSDT) untuk transaksi seller pada order dengan `itemCount` baris barang
+    /// @notice estimasi gas (mUSDT) untuk transaksi seller (markShipped + releaseWithAcceptance)
+    ///         dengan `itemCount` baris barang
     function quoteGasFee(uint32 itemCount) public view returns (uint256) {
         uint256 units = baseGasUnits + perItemGasUnits * itemCount;
         return (units * gasPriceRefWei * musdtPerEth) / 1e18;
     }
 
-    /// @notice buyer menyimpan harga barang + ongkir + estimasi gas ke escrow.
-    ///         Butuh `approve` mUSDT ke contract ini terlebih dahulu.
-    /// @param maxGasFee batas estimasi gas yang disetujui buyer di UI (melindungi dari perubahan parameter)
+    /// @notice buyer menyimpan harga barang + ongkir + estimasi gas ke escrow (butuh approve mUSDT)
+    /// @param maxGasFee batas estimasi gas yang disetujui buyer di UI
     function deposit(
         bytes32 orderId,
         address seller,
@@ -194,12 +181,8 @@ contract ChainShopEscrow is AccessControl, Pausable, ReentrancyGuard {
             gasFee: gasFee,
             itemCount: itemCount,
             fundedAt: uint64(block.timestamp),
+            shipDeadline: deadline,
             shippedAt: 0,
-            deliveredAt: 0,
-            deadline: deadline,
-            pausedRemaining: 0,
-            refundCount: 0,
-            refundFromShipped: false,
             status: Status.Funded
         });
 
@@ -208,18 +191,10 @@ contract ChainShopEscrow is AccessControl, Pausable, ReentrancyGuard {
     }
 
     // =====================================================================
-    // Seller
+    // Seller: kirim + invoice
     // =====================================================================
 
-    /// @notice seller menolak order sebelum kirim, semua dana kembali ke buyer
-    function sellerCancel(bytes32 orderId) external nonReentrant {
-        Order storage o = orders[orderId];
-        if (msg.sender != o.seller) revert NotSeller();
-        if (o.status != Status.Funded) revert InvalidStatus(o.status);
-        _cancel(orderId, o, CancelReason.SellerRejected);
-    }
-
-    /// @notice seller menyerahkan barang ke kurir dan mencatat invoice on-chain
+    /// @notice seller menyerahkan barang ke kurir dan mencatat invoice onchain (satu-satunya tx seller di alur normal)
     function markShipped(
         bytes32 orderId,
         string calldata invoiceId,
@@ -230,7 +205,7 @@ contract ChainShopEscrow is AccessControl, Pausable, ReentrancyGuard {
         Order storage o = orders[orderId];
         if (msg.sender != o.seller) revert NotSeller();
         if (o.status != Status.Funded) revert InvalidStatus(o.status);
-        if (block.timestamp > o.deadline) revert DeadlinePassed();
+        if (block.timestamp > o.shipDeadline) revert DeadlinePassed();
         if (bytes(invoiceId).length == 0 || bytes(trackingNumber).length == 0 || bytes(courier).length == 0) {
             revert InvalidInput();
         }
@@ -245,7 +220,6 @@ contract ChainShopEscrow is AccessControl, Pausable, ReentrancyGuard {
 
         o.status = Status.Shipped;
         o.shippedAt = uint64(block.timestamp);
-        o.deadline = 0;
 
         emit Shipped(orderId, block.timestamp);
         emit InvoiceRecorded(
@@ -265,125 +239,74 @@ contract ChainShopEscrow is AccessControl, Pausable, ReentrancyGuard {
         );
     }
 
-    /// @notice seller menandai barang sudah sampai di buyer, timer buyer mulai berjalan
-    function markDelivered(bytes32 orderId) external {
+    // =====================================================================
+    // Pencairan dana
+    // =====================================================================
+
+    /// @notice dana (barang + ongkir + estimasi gas) dilepas ke seller.
+    ///         Buyer: saat menerima barang. Operator/admin: auto release (timer off-chain habis / retur tidak dikirim).
+    function release(bytes32 orderId) external nonReentrant {
         Order storage o = orders[orderId];
-        if (msg.sender != o.seller) revert NotSeller();
         if (o.status != Status.Shipped) revert InvalidStatus(o.status);
-
-        o.status = Status.Delivered;
-        o.deliveredAt = uint64(block.timestamp);
-        o.deadline = uint64(block.timestamp) + buyerConfirmWindow;
-        emit Delivered(orderId, o.deadline);
+        if (msg.sender != o.buyer && !_isOperatorOrAdmin(msg.sender)) revert NotAllowed();
+        _release(orderId, o);
     }
 
-    /// @notice seller mengonfirmasi retur sudah diterima, refund dicairkan ke buyer
-    function confirmReturnReceived(bytes32 orderId) external nonReentrant {
+    /// @notice seller (atau operator/admin) mencairkan dana memakai tanda tangan persetujuan buyer.
+    ///         Buyer tidak membayar gas: ia hanya menandatangani pesan EIP-712 `Acceptance` di MetaMask.
+    ///         Tanpa tanda tangan buyer yang valid, seller tetap tidak bisa mencairkan dana.
+    function releaseWithAcceptance(bytes32 orderId, bytes calldata signature) external nonReentrant {
         Order storage o = orders[orderId];
-        if (msg.sender != o.seller) revert NotSeller();
-        if (o.status != Status.ReturnShipped && o.status != Status.ReturnDelivered) revert InvalidStatus(o.status);
-        _refund(orderId, o, false);
+        if (o.status != Status.Shipped) revert InvalidStatus(o.status);
+        if (msg.sender != o.seller && !_isOperatorOrAdmin(msg.sender)) revert NotAllowed();
+        if (!SignatureChecker.isValidSignatureNow(o.buyer, _acceptanceDigest(orderId, o), signature)) {
+            revert InvalidSignature();
+        }
+        _release(orderId, o);
     }
 
-    // =====================================================================
-    // Buyer
-    // =====================================================================
-
-    /// @notice buyer menerima barang, dana (barang + ongkir + estimasi gas) cair ke seller
-    function confirmReceived(bytes32 orderId) external nonReentrant {
+    /// @notice dana dikembalikan ke buyer.
+    ///         - sebelum dikirim (Funded): semua dana ke buyer (seller tolak / auto cancel).
+    ///         - setelah dikirim (Shipped): barang + ongkir ke buyer, estimasi gas ke seller
+    ///           (seller konfirmasi retur, admin approve refund barang tak sampai, operator auto refund).
+    ///         Boleh dipanggil seller order tersebut, operator, atau admin.
+    function refund(bytes32 orderId) external nonReentrant {
         Order storage o = orders[orderId];
-        if (msg.sender != o.buyer) revert NotBuyer();
-        if (o.status != Status.Delivered) revert InvalidStatus(o.status);
-        _complete(orderId, o, false);
-    }
+        if (msg.sender != o.seller && !_isOperatorOrAdmin(msg.sender)) revert NotAllowed();
 
-    /// @notice buyer mengajukan refund (maksimal 3x per order).
-    ///         - status Delivered: selama timer buyer belum habis, timer di-pause
-    ///         - status Shipped: hanya jika sudah lewat `notDeliveredWindow` sejak ship (barang tak kunjung sampai)
-    function requestRefund(bytes32 orderId) external {
-        Order storage o = orders[orderId];
-        if (msg.sender != o.buyer) revert NotBuyer();
-        if (o.refundCount >= MAX_REFUND_REQUESTS) revert RefundLimitReached();
-
-        if (o.status == Status.Delivered) {
-            if (block.timestamp > o.deadline) revert DeadlinePassed();
-            o.pausedRemaining = o.deadline - uint64(block.timestamp);
-            o.refundFromShipped = false;
+        if (o.status == Status.Funded) {
+            _cancel(orderId, o);
         } else if (o.status == Status.Shipped) {
-            uint256 availableAt = uint256(o.shippedAt) + notDeliveredWindow;
-            if (block.timestamp < availableAt) revert RefundNotAllowedYet(availableAt);
-            o.pausedRemaining = 0;
-            o.refundFromShipped = true;
+            _refund(orderId, o);
         } else {
             revert InvalidStatus(o.status);
         }
-
-        o.refundCount += 1;
-        o.status = Status.RefundRequested;
-        o.deadline = 0;
-        emit RefundRequested(orderId, o.refundCount, o.refundFromShipped);
-    }
-
-    /// @notice buyer menyerahkan barang retur ke kurir (maksimal `returnShipWindow` sejak refund disetujui)
-    function markReturnShipped(bytes32 orderId) external {
-        Order storage o = orders[orderId];
-        if (msg.sender != o.buyer) revert NotBuyer();
-        if (o.status != Status.ReturnPending) revert InvalidStatus(o.status);
-        if (block.timestamp > o.deadline) revert DeadlinePassed();
-
-        o.status = Status.ReturnShipped;
-        o.deadline = 0;
-        emit ReturnShipped(orderId);
-    }
-
-    /// @notice buyer menandai retur sudah sampai di seller, timer seller mulai berjalan
-    function markReturnDelivered(bytes32 orderId) external {
-        Order storage o = orders[orderId];
-        if (msg.sender != o.buyer) revert NotBuyer();
-        if (o.status != Status.ReturnShipped) revert InvalidStatus(o.status);
-
-        o.status = Status.ReturnDelivered;
-        o.deadline = uint64(block.timestamp) + returnConfirmWindow;
-        emit ReturnDelivered(orderId, o.deadline);
     }
 
     // =====================================================================
-    // Admin (= arbiter)
+    // Pintu darurat (tidak bergantung pada backend)
     // =====================================================================
 
-    function approveRefund(bytes32 orderId) external onlyRole(ADMIN_ROLE) nonReentrant {
+    /// @notice seller tidak mengirim sebelum batas waktu -> siapa saja bisa membatalkan, semua dana ke buyer
+    function cancelExpired(bytes32 orderId) external nonReentrant {
         Order storage o = orders[orderId];
-        if (o.status != Status.RefundRequested) revert InvalidStatus(o.status);
-
-        if (o.refundFromShipped) {
-            // barang tak pernah sampai: tidak ada retur, dana langsung dikembalikan
-            emit RefundApproved(orderId, false, 0);
-            _refund(orderId, o, false);
-            return;
-        }
-
-        o.status = Status.ReturnPending;
-        o.deadline = uint64(block.timestamp) + returnShipWindow;
-        o.pausedRemaining = 0;
-        emit RefundApproved(orderId, true, o.deadline);
+        if (o.status != Status.Funded) revert InvalidStatus(o.status);
+        if (block.timestamp <= o.shipDeadline) revert DeadlineNotPassed();
+        _cancel(orderId, o);
     }
 
-    /// @notice refund ditolak: order kembali ke tahap sebelumnya, timer buyer lanjut dari sisa waktu
-    function rejectRefund(bytes32 orderId) external onlyRole(ADMIN_ROLE) {
+    /// @notice backend tidak memutuskan apa pun lama sekali setelah dikirim -> seller bisa klaim dana
+    function claimStale(bytes32 orderId) external nonReentrant {
         Order storage o = orders[orderId];
-        if (o.status != Status.RefundRequested) revert InvalidStatus(o.status);
-
-        if (o.refundFromShipped) {
-            o.status = Status.Shipped;
-            o.deadline = 0;
-        } else {
-            o.status = Status.Delivered;
-            o.deadline = uint64(block.timestamp) + o.pausedRemaining;
-        }
-        o.pausedRemaining = 0;
-        o.refundFromShipped = false;
-        emit RefundRejected(orderId, o.deadline);
+        if (msg.sender != o.seller) revert NotSeller();
+        if (o.status != Status.Shipped) revert InvalidStatus(o.status);
+        if (block.timestamp <= uint256(o.shippedAt) + sellerClaimWindow) revert DeadlineNotPassed();
+        _release(orderId, o);
     }
+
+    // =====================================================================
+    // Admin
+    // =====================================================================
 
     function setGasParams(
         uint256 baseGasUnits_,
@@ -394,25 +317,13 @@ contract ChainShopEscrow is AccessControl, Pausable, ReentrancyGuard {
         _setGasParams(baseGasUnits_, perItemGasUnits_, gasPriceRefWei_, musdtPerEth_);
     }
 
-    function setWindows(
-        uint64 sellerShip,
-        uint64 buyerConfirm,
-        uint64 returnShip,
-        uint64 returnConfirm,
-        uint64 notDelivered
-    ) external onlyRole(ADMIN_ROLE) {
-        if (
-            sellerShip == 0 || buyerConfirm == 0 || returnShip == 0 || returnConfirm == 0 || notDelivered == 0 ||
-            sellerShip > MAX_WINDOW || buyerConfirm > MAX_WINDOW || returnShip > MAX_WINDOW ||
-            returnConfirm > MAX_WINDOW || notDelivered > MAX_WINDOW
-        ) revert InvalidInput();
-
+    function setWindows(uint64 sellerShip, uint64 sellerClaim) external onlyRole(ADMIN_ROLE) {
+        if (sellerShip == 0 || sellerClaim == 0 || sellerShip > MAX_WINDOW || sellerClaim > MAX_WINDOW) {
+            revert InvalidInput();
+        }
         sellerShipWindow = sellerShip;
-        buyerConfirmWindow = buyerConfirm;
-        returnShipWindow = returnShip;
-        returnConfirmWindow = returnConfirm;
-        notDeliveredWindow = notDelivered;
-        emit WindowsUpdated(sellerShip, buyerConfirm, returnShip, returnConfirm, notDelivered);
+        sellerClaimWindow = sellerClaim;
+        emit WindowsUpdated(sellerShip, sellerClaim);
     }
 
     /// @notice pause hanya menghentikan deposit baru; order berjalan tetap bisa diselesaikan
@@ -425,43 +336,6 @@ contract ChainShopEscrow is AccessControl, Pausable, ReentrancyGuard {
     }
 
     // =====================================================================
-    // Auto (siapa saja boleh panggil, contract yang mengecek batas waktu)
-    // =====================================================================
-
-    /// @notice seller tidak ship dalam batas waktu -> order batal, semua dana ke buyer
-    function autoCancel(bytes32 orderId) external nonReentrant {
-        Order storage o = orders[orderId];
-        if (o.status != Status.Funded) revert InvalidStatus(o.status);
-        if (block.timestamp <= o.deadline) revert DeadlineNotPassed();
-        _cancel(orderId, o, CancelReason.ShipDeadlinePassed);
-    }
-
-    /// @notice buyer tidak merespons dalam batas waktu -> otomatis diterima, dana ke seller
-    function autoRelease(bytes32 orderId) external nonReentrant {
-        Order storage o = orders[orderId];
-        if (o.status != Status.Delivered) revert InvalidStatus(o.status);
-        if (block.timestamp <= o.deadline) revert DeadlineNotPassed();
-        _complete(orderId, o, true);
-    }
-
-    /// @notice buyer tidak mengirim retur dalam batas waktu -> refund batal, dana ke seller
-    function expireReturn(bytes32 orderId) external nonReentrant {
-        Order storage o = orders[orderId];
-        if (o.status != Status.ReturnPending) revert InvalidStatus(o.status);
-        if (block.timestamp <= o.deadline) revert DeadlineNotPassed();
-        emit ReturnExpired(orderId);
-        _complete(orderId, o, true);
-    }
-
-    /// @notice seller tidak konfirmasi retur dalam batas waktu -> refund otomatis ke buyer
-    function autoRefund(bytes32 orderId) external nonReentrant {
-        Order storage o = orders[orderId];
-        if (o.status != Status.ReturnDelivered) revert InvalidStatus(o.status);
-        if (block.timestamp <= o.deadline) revert DeadlineNotPassed();
-        _refund(orderId, o, true);
-    }
-
-    // =====================================================================
     // Views
     // =====================================================================
 
@@ -469,46 +343,56 @@ contract ChainShopEscrow is AccessControl, Pausable, ReentrancyGuard {
         return orders[orderId];
     }
 
-    /// @notice aksi otomatis yang sudah bisa dijalankan untuk order ini:
-    ///         0 = tidak ada, 1 = autoCancel, 2 = autoRelease, 3 = expireReturn, 4 = autoRefund
-    function pendingAutoAction(bytes32 orderId) external view returns (uint8) {
+    function isOperatorOrAdmin(address account) external view returns (bool) {
+        return _isOperatorOrAdmin(account);
+    }
+
+    /// @notice digest EIP-712 yang harus ditandatangani buyer untuk order ini
+    function acceptanceDigest(bytes32 orderId) external view returns (bytes32) {
+        return _acceptanceDigest(orderId, orders[orderId]);
+    }
+
+    /// @notice dipakai backend untuk memverifikasi tanda tangan buyer sebelum disimpan
+    function isValidAcceptance(bytes32 orderId, bytes calldata signature) external view returns (bool) {
         Order storage o = orders[orderId];
-        if (o.deadline == 0 || block.timestamp <= o.deadline) return 0;
-        if (o.status == Status.Funded) return 1;
-        if (o.status == Status.Delivered) return 2;
-        if (o.status == Status.ReturnPending) return 3;
-        if (o.status == Status.ReturnDelivered) return 4;
-        return 0;
+        if (o.buyer == address(0)) return false;
+        return SignatureChecker.isValidSignatureNow(o.buyer, _acceptanceDigest(orderId, o), signature);
     }
 
     // =====================================================================
     // Internal
     // =====================================================================
 
-    function _cancel(bytes32 orderId, Order storage o, CancelReason reason) private {
+    function _isOperatorOrAdmin(address account) private view returns (bool) {
+        return hasRole(OPERATOR_ROLE, account) || hasRole(ADMIN_ROLE, account);
+    }
+
+    function _acceptanceDigest(bytes32 orderId, Order storage o) private view returns (bytes32) {
+        uint256 amount = o.itemsTotal + o.shippingFee + o.gasFee;
+        return _hashTypedDataV4(keccak256(abi.encode(ACCEPTANCE_TYPEHASH, orderId, o.buyer, o.seller, amount)));
+    }
+
+    function _cancel(bytes32 orderId, Order storage o) private {
         uint256 amount = o.itemsTotal + o.shippingFee + o.gasFee;
         o.status = Status.Cancelled;
-        o.deadline = 0;
         token.safeTransfer(o.buyer, amount);
-        emit OrderCancelled(orderId, reason, amount);
+        emit OrderCancelled(orderId, amount, msg.sender);
     }
 
-    function _complete(bytes32 orderId, Order storage o, bool automatic) private {
+    function _release(bytes32 orderId, Order storage o) private {
         uint256 amount = o.itemsTotal + o.shippingFee + o.gasFee;
         o.status = Status.Completed;
-        o.deadline = 0;
         token.safeTransfer(o.seller, amount);
-        emit Completed(orderId, amount, automatic);
+        emit Released(orderId, amount, msg.sender);
     }
 
-    function _refund(bytes32 orderId, Order storage o, bool automatic) private {
+    function _refund(bytes32 orderId, Order storage o) private {
         uint256 toBuyer = o.itemsTotal + o.shippingFee;
         uint256 toSeller = o.gasFee;
         o.status = Status.Refunded;
-        o.deadline = 0;
         token.safeTransfer(o.buyer, toBuyer);
         if (toSeller > 0) token.safeTransfer(o.seller, toSeller);
-        emit Refunded(orderId, toBuyer, toSeller, automatic);
+        emit Refunded(orderId, toBuyer, toSeller, msg.sender);
     }
 
     function _setGasParams(

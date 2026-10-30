@@ -4,7 +4,8 @@
 //   npx hardhat run scripts/deploy.js --network sepolia
 //
 // ENV opsional:
-//   ADMIN_WALLET   wallet admin/arbiter (default: wallet deployer)
+//   ADMIN_WALLET     wallet admin/arbiter (default: wallet deployer)
+//   OPERATOR_WALLET  wallet backend/cron (auto release & refund). Address, bukan private key.
 //   MUSDT_ADDRESS  pakai MockUSDT yang sudah ada (tidak deploy ulang token)
 const fs = require("fs");
 const path = require("path");
@@ -17,12 +18,25 @@ async function main() {
   const [deployer] = await ethers.getSigners();
   if (!deployer) throw new Error("DEPLOYER_PRIVATE_KEY belum diisi di .env");
 
-  const admin = process.env.ADMIN_WALLET || deployer.address;
+  // alamat di .env harus 0x + 40 karakter hex; selain itu ethers mengira itu nama ENS dan error "resolveName"
+  function envAddress(name) {
+    const raw = (process.env[name] || "").trim().replace(/^["']|["']$/g, "");
+    if (!raw) return "";
+    if (!ethers.isAddress(raw)) {
+      const hint = /^(0x)?[0-9a-fA-F]{64}$/.test(raw) ? " (sepertinya ini PRIVATE KEY, isi dengan ADDRESS wallet)" : "";
+      throw new Error(`${name} di .env bukan address yang valid: "${raw}"${hint}. Format: 0x diikuti 40 karakter hex, atau kosongkan.`);
+    }
+    return ethers.getAddress(raw.toLowerCase());
+  }
+
+  const admin = envAddress("ADMIN_WALLET") || deployer.address;
+  const operator = envAddress("OPERATOR_WALLET") || ethers.ZeroAddress;
   console.log(`Network  : ${network.name} (chainId ${network.config.chainId ?? "local"})`);
   console.log(`Deployer : ${deployer.address}`);
   console.log(`Admin    : ${admin}`);
+  console.log(`Operator : ${operator === ethers.ZeroAddress ? "(belum diisi, grant nanti lewat admin-tools)" : operator}`);
 
-  let tokenAddress = process.env.MUSDT_ADDRESS;
+  let tokenAddress = envAddress("MUSDT_ADDRESS");
   if (tokenAddress) {
     console.log(`MockUSDT : pakai yang sudah ada ${tokenAddress}`);
   } else {
@@ -35,6 +49,7 @@ async function main() {
   const escrow = await ethers.deployContract("ChainShopEscrow", [
     tokenAddress,
     admin,
+    operator,
     GAS_DEFAULTS.baseGasUnits,
     GAS_DEFAULTS.perItemGasUnits,
     GAS_DEFAULTS.gasPriceRefWei,
@@ -52,6 +67,7 @@ async function main() {
     escrow: escrowAddress,
     escrowDeployBlock: deployBlock,
     admin,
+    operator,
     deployer: deployer.address,
     gasParams: Object.fromEntries(Object.entries(GAS_DEFAULTS).map(([k, v]) => [k, v.toString()])),
     deployedAt: new Date().toISOString(),
@@ -66,9 +82,9 @@ async function main() {
 
   if (network.name === "sepolia") {
     console.log("\nVerifikasi di Etherscan (setelah ~1 menit):");
-    if (!process.env.MUSDT_ADDRESS) console.log(`  npx hardhat verify --network sepolia ${tokenAddress}`);
+    if (!envAddress("MUSDT_ADDRESS")) console.log(`  npx hardhat verify --network sepolia ${tokenAddress}`);
     console.log(
-      `  npx hardhat verify --network sepolia ${escrowAddress} ${tokenAddress} ${admin} ` +
+      `  npx hardhat verify --network sepolia ${escrowAddress} ${tokenAddress} ${admin} ${operator} ` +
         `${GAS_DEFAULTS.baseGasUnits} ${GAS_DEFAULTS.perItemGasUnits} ${GAS_DEFAULTS.gasPriceRefWei} ${GAS_DEFAULTS.musdtPerEth}`,
     );
   }

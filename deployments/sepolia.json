@@ -1,0 +1,17 @@
+{
+  "network": "sepolia",
+  "chainId": 11155111,
+  "mockUsdt": "0x8EBb09f1575fa7c3F51f2C1d0da8B88867Da042D",
+  "escrow": "0x9c70aA863156f997d19D8c7d904F54Cc177f0341",
+  "escrowDeployBlock": 12023594,
+  "admin": "0x43f88b46C56c382Cb935337CB8447a97Ec25dDF8",
+  "operator": "0x89ca9C26F5688Ee270A92bFA26efF6500230E07f",
+  "deployer": "0x43f88b46C56c382Cb935337CB8447a97Ec25dDF8",
+  "gasParams": {
+    "baseGasUnits": "135000",
+    "perItemGasUnits": "5500",
+    "gasPriceRefWei": "2000000000",
+    "musdtPerEth": "3000000000"
+  },
+  "deployedAt": "2026-10-30T02:08:05.060Z"
+}

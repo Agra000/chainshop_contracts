@@ -7,22 +7,10 @@ const DAY = 24 * 60 * 60;
 const U = (n) => ethers.parseUnits(String(n), 6); // mUSDT 6 desimal
 const oid = (s) => ethers.keccak256(ethers.toUtf8Bytes(s));
 
-const Status = {
-  None: 0,
-  Funded: 1,
-  Shipped: 2,
-  Delivered: 3,
-  RefundRequested: 4,
-  ReturnPending: 5,
-  ReturnShipped: 6,
-  ReturnDelivered: 7,
-  Completed: 8,
-  Refunded: 9,
-  Cancelled: 10,
-};
+const Status = { None: 0, Funded: 1, Shipped: 2, Completed: 3, Refunded: 4, Cancelled: 5 };
 
-// default gas params (lihat scripts/deploy.js)
-const GAS = { base: 110_000n, perItem: 6_000n, priceWei: 2_000_000_000n, musdtPerEth: 3_000n * 10n ** 6n };
+// default gas params (lihat scripts/config.js)
+const GAS = { base: 135_000n, perItem: 5_500n, priceWei: 2_000_000_000n, musdtPerEth: 3_000n * 10n ** 6n };
 
 const ITEMS = [
   { name: "Semen Gresik 50kg", qty: 100n, unitPrice: U(65) },
@@ -33,11 +21,12 @@ const SHIPPING = U(1);
 const START = U(100_000); // saldo awal buyer
 
 async function deployFixture() {
-  const [admin, buyer, seller, other] = await ethers.getSigners();
+  const [admin, buyer, seller, operator, other] = await ethers.getSigners();
   const token = await ethers.deployContract("MockUSDT");
   const escrow = await ethers.deployContract("ChainShopEscrow", [
     await token.getAddress(),
     admin.address,
+    operator.address,
     GAS.base,
     GAS.perItem,
     GAS.priceWei,
@@ -48,7 +37,7 @@ async function deployFixture() {
   await token.connect(admin).mint(buyer.address, START - U(10_000));
   await token.connect(buyer).approve(await escrow.getAddress(), ethers.MaxUint256);
 
-  return { admin, buyer, seller, other, token, escrow };
+  return { admin, buyer, seller, operator, other, token, escrow };
 }
 
 async function fundedFixture() {
@@ -61,27 +50,47 @@ async function fundedFixture() {
   return { ...ctx, orderId, gasFee, total: ITEMS_TOTAL + SHIPPING + gasFee };
 }
 
-async function ship(ctx) {
+function ship(ctx) {
   return ctx.escrow.connect(ctx.seller).markShipped(ctx.orderId, "INV-2026-0001", ITEMS, "JNE", "JNE2610280001");
 }
 
-async function deliveredFixture() {
+async function shippedFixture() {
   const ctx = await fundedFixture();
   await ship(ctx);
-  await ctx.escrow.connect(ctx.seller).markDelivered(ctx.orderId);
   return ctx;
+}
+
+
+// tanda tangan EIP-712 buyer (gratis, tanpa gas) untuk releaseWithAcceptance
+async function signAcceptance(escrow, signer, orderId, override = {}) {
+  const o = await escrow.getOrder(orderId);
+  const { chainId } = await ethers.provider.getNetwork();
+  const domain = { name: "ChainShopEscrow", version: "1", chainId, verifyingContract: await escrow.getAddress() };
+  const types = {
+    Acceptance: [
+      { name: "orderId", type: "bytes32" },
+      { name: "buyer", type: "address" },
+      { name: "seller", type: "address" },
+      { name: "amount", type: "uint256" },
+    ],
+  };
+  const message = {
+    orderId,
+    buyer: o.buyer,
+    seller: o.seller,
+    amount: o.itemsTotal + o.shippingFee + o.gasFee,
+    ...override,
+  };
+  return signer.signTypedData(override.domain ?? domain, types, message);
 }
 
 describe("MockUSDT", function () {
   it("faucet memberi 10.000 mUSDT dan dibatasi 1x per 24 jam", async function () {
     const { token, other } = await loadFixture(deployFixture);
     expect(await token.decimals()).to.equal(6);
-
     await token.connect(other).faucet();
     expect(await token.balanceOf(other.address)).to.equal(U(10_000));
-
     await expect(token.connect(other).faucet()).to.be.revertedWithCustomError(token, "FaucetCooldown");
-
     await time.increase(DAY);
     await token.connect(other).faucet();
     expect(await token.balanceOf(other.address)).to.equal(U(20_000));
@@ -98,9 +107,8 @@ describe("MockUSDT", function () {
 
 describe("ChainShopEscrow", function () {
   describe("deposit", function () {
-    it("menahan harga barang + ongkir + estimasi gas", async function () {
+    it("menahan harga barang + ongkir + estimasi gas 1 transaksi seller", async function () {
       const { escrow, token, buyer, seller, orderId, gasFee, total } = await fundedFixture();
-
       const expectedGas = ((GAS.base + GAS.perItem * 2n) * GAS.priceWei * GAS.musdtPerEth) / 10n ** 18n;
       expect(gasFee).to.equal(expectedGas);
       expect(await token.balanceOf(await escrow.getAddress())).to.equal(total);
@@ -109,7 +117,7 @@ describe("ChainShopEscrow", function () {
       expect(o.buyer).to.equal(buyer.address);
       expect(o.seller).to.equal(seller.address);
       expect(o.status).to.equal(Status.Funded);
-      expect(o.deadline).to.equal(o.fundedAt + BigInt(3 * DAY));
+      expect(o.shipDeadline).to.equal(o.fundedAt + BigInt(3 * DAY));
     });
 
     it("menolak orderId ganda, seller = buyer, dan gas melebihi batas buyer", async function () {
@@ -134,39 +142,48 @@ describe("ChainShopEscrow", function () {
     });
   });
 
-  describe("seller tolak / timeout", function () {
-    it("sellerCancel mengembalikan semua dana ke buyer", async function () {
-      const { escrow, token, buyer, seller, orderId } = await fundedFixture();
-      await expect(escrow.connect(seller).sellerCancel(orderId))
+  describe("sebelum dikirim", function () {
+    it("seller tolak (refund saat Funded) -> semua dana ke buyer", async function () {
+      const { escrow, token, buyer, seller, orderId, total } = await fundedFixture();
+      await expect(escrow.connect(seller).refund(orderId))
         .to.emit(escrow, "OrderCancelled")
-        .withArgs(orderId, 0, anyValue);
+        .withArgs(orderId, total, seller.address);
       expect(await token.balanceOf(buyer.address)).to.equal(START);
       expect((await escrow.getOrder(orderId)).status).to.equal(Status.Cancelled);
     });
 
-    it("autoCancel hanya setelah 3 hari, boleh dipanggil siapa saja", async function () {
-      const { escrow, token, buyer, other, orderId } = await fundedFixture();
-      await expect(escrow.connect(other).autoCancel(orderId)).to.be.revertedWithCustomError(
-        escrow,
-        "DeadlineNotPassed",
-      );
-      expect(await escrow.pendingAutoAction(orderId)).to.equal(0);
-
+    it("operator auto cancel saat seller telat kirim", async function () {
+      const { escrow, token, buyer, operator, orderId } = await fundedFixture();
       await time.increase(3 * DAY + 1);
-      expect(await escrow.pendingAutoAction(orderId)).to.equal(1);
-      await escrow.connect(other).autoCancel(orderId);
+      await expect(escrow.connect(operator).refund(orderId)).to.emit(escrow, "OrderCancelled");
       expect(await token.balanceOf(buyer.address)).to.equal(START);
     });
 
-    it("seller tidak bisa ship setelah deadline", async function () {
+    it("pintu darurat cancelExpired: siapa saja, hanya setelah batas kirim", async function () {
+      const { escrow, token, buyer, other, orderId } = await fundedFixture();
+      await expect(escrow.connect(other).cancelExpired(orderId)).to.be.revertedWithCustomError(
+        escrow,
+        "DeadlineNotPassed",
+      );
+      await time.increase(3 * DAY + 1);
+      await escrow.connect(other).cancelExpired(orderId);
+      expect(await token.balanceOf(buyer.address)).to.equal(START);
+    });
+
+    it("seller tidak bisa ship setelah batas waktu", async function () {
       const ctx = await fundedFixture();
       await time.increase(3 * DAY + 1);
       await expect(ship(ctx)).to.be.revertedWithCustomError(ctx.escrow, "DeadlinePassed");
     });
+
+    it("buyer tidak bisa release sebelum barang dikirim", async function () {
+      const { escrow, buyer, orderId } = await fundedFixture();
+      await expect(escrow.connect(buyer).release(orderId)).to.be.revertedWithCustomError(escrow, "InvalidStatus");
+    });
   });
 
   describe("ship + invoice", function () {
-    it("mencatat invoice on-chain lengkap dengan item dan rincian biaya", async function () {
+    it("mencatat invoice onchain lengkap dengan item dan rincian biaya", async function () {
       const ctx = await fundedFixture();
       const { escrow, seller, buyer, orderId, gasFee, total } = ctx;
       await expect(ship(ctx))
@@ -208,144 +225,148 @@ describe("ChainShopEscrow", function () {
     });
   });
 
-  describe("selesai normal", function () {
-    it("buyer konfirmasi -> semua dana (barang + ongkir + gas) ke seller", async function () {
-      const { escrow, token, buyer, seller, orderId, total } = await deliveredFixture();
-      await expect(escrow.connect(buyer).confirmReceived(orderId))
-        .to.emit(escrow, "Completed")
-        .withArgs(orderId, total, false);
+  describe("release", function () {
+    it("buyer terima barang -> semua dana ke seller", async function () {
+      const { escrow, token, buyer, seller, orderId, total } = await shippedFixture();
+      await expect(escrow.connect(buyer).release(orderId))
+        .to.emit(escrow, "Released")
+        .withArgs(orderId, total, buyer.address);
       expect(await token.balanceOf(seller.address)).to.equal(total);
+      expect((await escrow.getOrder(orderId)).status).to.equal(Status.Completed);
     });
 
-    it("buyer diam 3 hari -> autoRelease", async function () {
-      const { escrow, token, seller, other, orderId, total } = await deliveredFixture();
-      await expect(escrow.connect(other).autoRelease(orderId)).to.be.revertedWithCustomError(
+    it("operator & admin boleh release (timer off-chain), pihak lain tidak", async function () {
+      const { escrow, operator, other, seller, orderId } = await shippedFixture();
+      await expect(escrow.connect(other).release(orderId)).to.be.revertedWithCustomError(escrow, "NotAllowed");
+      await expect(escrow.connect(seller).release(orderId)).to.be.revertedWithCustomError(escrow, "NotAllowed");
+      await expect(escrow.connect(operator).release(orderId)).to.emit(escrow, "Released");
+    });
+
+    it("tidak bisa dicairkan dua kali", async function () {
+      const { escrow, buyer, operator, orderId } = await shippedFixture();
+      await escrow.connect(buyer).release(orderId);
+      await expect(escrow.connect(operator).release(orderId)).to.be.revertedWithCustomError(escrow, "InvalidStatus");
+      await expect(escrow.connect(operator).refund(orderId)).to.be.revertedWithCustomError(escrow, "InvalidStatus");
+    });
+
+    it("pintu darurat claimStale: seller klaim setelah 30 hari tanpa keputusan", async function () {
+      const { escrow, token, seller, orderId, total } = await shippedFixture();
+      await expect(escrow.connect(seller).claimStale(orderId)).to.be.revertedWithCustomError(
         escrow,
         "DeadlineNotPassed",
       );
-      await time.increase(3 * DAY + 1);
-      expect(await escrow.pendingAutoAction(orderId)).to.equal(2);
-      await escrow.connect(other).autoRelease(orderId);
+      await time.increase(30 * DAY + 1);
+      await escrow.connect(seller).claimStale(orderId);
       expect(await token.balanceOf(seller.address)).to.equal(total);
     });
   });
 
-  describe("refund & retur", function () {
-    it("refund di-pause timernya, ditolak -> lanjut dari sisa waktu", async function () {
-      const { escrow, admin, buyer, orderId } = await deliveredFixture();
-      await time.increase(1 * DAY);
-      await escrow.connect(buyer).requestRefund(orderId);
-      let o = await escrow.getOrder(orderId);
-      expect(o.status).to.equal(Status.RefundRequested);
-      const remaining = o.pausedRemaining;
-      expect(remaining).to.be.closeTo(BigInt(2 * DAY), 5n);
+  describe("releaseWithAcceptance (buyer tanda tangan, seller klaim)", function () {
+    it("seller klaim dana dengan tanda tangan buyer -> semua dana ke seller, gas dibayar seller", async function () {
+      const ctx = await loadFixture(shippedFixture);
+      const { escrow, token, buyer, seller, orderId, total } = ctx;
+      const sig = await signAcceptance(escrow, buyer, orderId);
+      expect(await escrow.isValidAcceptance(orderId, sig)).to.equal(true);
+      const buyerEthBefore = await ethers.provider.getBalance(buyer.address);
 
-      await time.increase(5 * DAY); // admin lama memutuskan, timer tidak berjalan
-      await escrow.connect(admin).rejectRefund(orderId);
-      o = await escrow.getOrder(orderId);
-      expect(o.status).to.equal(Status.Delivered);
-      expect(o.deadline - BigInt(await time.latest())).to.equal(remaining);
-    });
-
-    it("maksimal 3 kali pengajuan refund", async function () {
-      const { escrow, admin, buyer, orderId } = await deliveredFixture();
-      for (let i = 0; i < 3; i++) {
-        await escrow.connect(buyer).requestRefund(orderId);
-        await escrow.connect(admin).rejectRefund(orderId);
-      }
-      await expect(escrow.connect(buyer).requestRefund(orderId)).to.be.revertedWithCustomError(
-        escrow,
-        "RefundLimitReached",
-      );
-    });
-
-    it("refund disetujui -> retur -> seller konfirmasi: barang+ongkir ke buyer, gas ke seller", async function () {
-      const { escrow, token, admin, buyer, seller, orderId, gasFee } = await deliveredFixture();
-      await escrow.connect(buyer).requestRefund(orderId);
-      await expect(escrow.connect(admin).approveRefund(orderId)).to.emit(escrow, "RefundApproved");
-      expect((await escrow.getOrder(orderId)).status).to.equal(Status.ReturnPending);
-
-      await escrow.connect(buyer).markReturnShipped(orderId);
-      await escrow.connect(buyer).markReturnDelivered(orderId);
-      await expect(escrow.connect(seller).confirmReturnReceived(orderId))
-        .to.emit(escrow, "Refunded")
-        .withArgs(orderId, ITEMS_TOTAL + SHIPPING, gasFee, false);
-
-      expect(await token.balanceOf(buyer.address)).to.equal(START - gasFee);
-      expect(await token.balanceOf(seller.address)).to.equal(gasFee);
-    });
-
-    it("buyer tidak kirim retur 3 hari -> refund batal, dana ke seller", async function () {
-      const { escrow, token, admin, buyer, seller, other, orderId, total } = await deliveredFixture();
-      await escrow.connect(buyer).requestRefund(orderId);
-      await escrow.connect(admin).approveRefund(orderId);
-      await time.increase(3 * DAY + 1);
-      await expect(escrow.connect(buyer).markReturnShipped(orderId)).to.be.revertedWithCustomError(
-        escrow,
-        "DeadlinePassed",
-      );
-      expect(await escrow.pendingAutoAction(orderId)).to.equal(3);
-      await expect(escrow.connect(other).expireReturn(orderId)).to.emit(escrow, "ReturnExpired");
+      await expect(escrow.connect(seller).releaseWithAcceptance(orderId, sig))
+        .to.emit(escrow, "Released")
+        .withArgs(orderId, total, seller.address);
       expect(await token.balanceOf(seller.address)).to.equal(total);
+      expect((await escrow.getOrder(orderId)).status).to.equal(Status.Completed);
+      // buyer tidak mengeluarkan ETH sama sekali untuk menerima barang
+      expect(await ethers.provider.getBalance(buyer.address)).to.equal(buyerEthBefore);
     });
 
-    it("seller tidak konfirmasi retur 3 hari -> autoRefund", async function () {
-      const { escrow, token, admin, buyer, other, orderId, gasFee } = await deliveredFixture();
-      await escrow.connect(buyer).requestRefund(orderId);
-      await escrow.connect(admin).approveRefund(orderId);
-      await escrow.connect(buyer).markReturnShipped(orderId);
-      await escrow.connect(buyer).markReturnDelivered(orderId);
-      await time.increase(3 * DAY + 1);
-      expect(await escrow.pendingAutoAction(orderId)).to.equal(4);
-      await expect(escrow.connect(other).autoRefund(orderId))
-        .to.emit(escrow, "Refunded")
-        .withArgs(orderId, ITEMS_TOTAL + SHIPPING, gasFee, true);
-      expect(await token.balanceOf(buyer.address)).to.equal(START - gasFee);
+    it("menolak tanda tangan selain buyer, order lain, jumlah lain, atau contract lain", async function () {
+      const ctx = await loadFixture(shippedFixture);
+      const { escrow, buyer, seller, other, orderId } = ctx;
+      const bad = [
+        await signAcceptance(escrow, other, orderId),
+        await signAcceptance(escrow, seller, orderId),
+        await signAcceptance(escrow, buyer, orderId, { orderId: oid("order-lain") }),
+        await signAcceptance(escrow, buyer, orderId, { amount: 1n }),
+        await signAcceptance(escrow, buyer, orderId, {
+          domain: { name: "ChainShopEscrow", version: "1", chainId: 1n, verifyingContract: await escrow.getAddress() },
+        }),
+      ];
+      for (const sig of bad) {
+        expect(await escrow.isValidAcceptance(orderId, sig)).to.equal(false);
+        await expect(escrow.connect(seller).releaseWithAcceptance(orderId, sig)).to.be.revertedWithCustomError(
+          escrow,
+          "InvalidSignature",
+        );
+      }
     });
 
-    it("barang tak sampai 7 hari -> refund langsung tanpa retur", async function () {
-      const ctx = await fundedFixture();
-      const { escrow, token, admin, buyer, seller, orderId, gasFee } = ctx;
+    it("hanya seller / operator / admin yang boleh mengirim, dan hanya saat Shipped", async function () {
+      const ctx = await loadFixture(fundedFixture);
+      const { escrow, buyer, seller, operator, other, orderId } = ctx;
+      const early = await signAcceptance(escrow, buyer, orderId);
+      await expect(escrow.connect(seller).releaseWithAcceptance(orderId, early))
+        .to.be.revertedWithCustomError(escrow, "InvalidStatus")
+        .withArgs(Status.Funded);
+
       await ship(ctx);
-      await expect(escrow.connect(buyer).requestRefund(orderId)).to.be.revertedWithCustomError(
+      const sig = await signAcceptance(escrow, buyer, orderId);
+      await expect(escrow.connect(other).releaseWithAcceptance(orderId, sig)).to.be.revertedWithCustomError(
         escrow,
-        "RefundNotAllowedYet",
+        "NotAllowed",
       );
-      await time.increase(7 * DAY);
-      await escrow.connect(buyer).requestRefund(orderId);
-      await expect(escrow.connect(admin).approveRefund(orderId))
+      await escrow.connect(operator).releaseWithAcceptance(orderId, sig);
+      // tidak bisa dipakai ulang (dana sudah cair)
+      await expect(escrow.connect(seller).releaseWithAcceptance(orderId, sig))
+        .to.be.revertedWithCustomError(escrow, "InvalidStatus")
+        .withArgs(Status.Completed);
+    });
+  });
+
+  describe("refund setelah dikirim", function () {
+    it("seller konfirmasi retur -> barang+ongkir ke buyer, estimasi gas ke seller", async function () {
+      const { escrow, token, buyer, seller, orderId, gasFee } = await shippedFixture();
+      await expect(escrow.connect(seller).refund(orderId))
         .to.emit(escrow, "Refunded")
-        .withArgs(orderId, ITEMS_TOTAL + SHIPPING, gasFee, false);
+        .withArgs(orderId, ITEMS_TOTAL + SHIPPING, gasFee, seller.address);
       expect(await token.balanceOf(buyer.address)).to.equal(START - gasFee);
       expect(await token.balanceOf(seller.address)).to.equal(gasFee);
+      expect((await escrow.getOrder(orderId)).status).to.equal(Status.Refunded);
     });
 
-    it("refund barang tak sampai ditolak -> kembali ke Shipped", async function () {
-      const ctx = await fundedFixture();
-      const { escrow, admin, buyer, orderId } = ctx;
-      await ship(ctx);
-      await time.increase(7 * DAY);
-      await escrow.connect(buyer).requestRefund(orderId);
-      await escrow.connect(admin).rejectRefund(orderId);
-      expect((await escrow.getOrder(orderId)).status).to.equal(Status.Shipped);
+    it("admin approve refund barang tak sampai & operator auto refund", async function () {
+      const a = await shippedFixture();
+      await expect(a.escrow.connect(a.admin).refund(a.orderId)).to.emit(a.escrow, "Refunded");
+
+      const b = await loadFixture(deployFixture);
+      const id = oid("order-2");
+      const gas = await b.escrow.quoteGasFee(2);
+      await b.escrow.connect(b.buyer).deposit(id, b.seller.address, ITEMS_TOTAL, SHIPPING, 2, gas);
+      await b.escrow.connect(b.seller).markShipped(id, "INV-2", ITEMS, "JNE", "R2");
+      await expect(b.escrow.connect(b.operator).refund(id)).to.emit(b.escrow, "Refunded");
     });
 
-    it("hanya admin yang bisa approve / reject", async function () {
-      const { escrow, buyer, other, orderId } = await deliveredFixture();
-      await escrow.connect(buyer).requestRefund(orderId);
-      await expect(escrow.connect(other).approveRefund(orderId)).to.be.revertedWithCustomError(
+    it("buyer & pihak lain tidak bisa refund sendiri", async function () {
+      const { escrow, buyer, other, orderId } = await shippedFixture();
+      await expect(escrow.connect(buyer).refund(orderId)).to.be.revertedWithCustomError(escrow, "NotAllowed");
+      await expect(escrow.connect(other).refund(orderId)).to.be.revertedWithCustomError(escrow, "NotAllowed");
+    });
+  });
+
+  describe("admin", function () {
+    it("parameter & role hanya bisa diubah admin", async function () {
+      const { escrow, admin, other } = await loadFixture(deployFixture);
+      await expect(escrow.connect(other).setWindows(60, 60)).to.be.revertedWithCustomError(
         escrow,
         "AccessControlUnauthorizedAccount",
       );
-      await expect(escrow.connect(buyer).rejectRefund(orderId)).to.be.revertedWithCustomError(
-        escrow,
-        "AccessControlUnauthorizedAccount",
-      );
+      await escrow.connect(admin).setWindows(300, 600);
+      expect(await escrow.sellerShipWindow()).to.equal(300);
+      expect(await escrow.isOperatorOrAdmin(admin.address)).to.equal(true);
+      expect(await escrow.isOperatorOrAdmin(other.address)).to.equal(false);
     });
   });
 
   describe("gas usage (untuk kalibrasi estimasi)", function () {
-    it("mencetak gas markShipped & markDelivered", async function () {
+    it("mencetak gas markShipped + klaim seller per jumlah item", async function () {
       const { escrow, buyer, seller } = await loadFixture(deployFixture);
       for (const n of [1, 2, 5, 10]) {
         const items = Array.from({ length: n }, (_, i) => ({
@@ -356,11 +377,16 @@ describe("ChainShopEscrow", function () {
         const total = items.reduce((s, it) => s + it.qty * it.unitPrice, 0n);
         const id = oid(`gas-${n}`);
         await escrow.connect(buyer).deposit(id, seller.address, total, SHIPPING, n, U(1000));
-        const shipTx = await escrow.connect(seller).markShipped(id, "INV-2026-ABCDEF", items, "J&T Express", "JT2610281234567");
+        const shipTx = await escrow
+          .connect(seller)
+          .markShipped(id, "INV-2026-ABCDEF", items, "J&T Express", "JT2610281234567");
         const shipGas = (await shipTx.wait()).gasUsed;
-        const delTx = await escrow.connect(seller).markDelivered(id);
-        const delGas = (await delTx.wait()).gasUsed;
-        console.log(`      items=${n} markShipped=${shipGas} markDelivered=${delGas} total=${shipGas + delGas}`);
+        const sig = await signAcceptance(escrow, buyer, id);
+        const claimTx = await escrow.connect(seller).releaseWithAcceptance(id, sig);
+        const claimGas = (await claimTx.wait()).gasUsed;
+        const estimateUnits = GAS.base + GAS.perItem * BigInt(n);
+        console.log(`      items=${n} markShipped=${shipGas} claim=${claimGas} total=${shipGas + claimGas} estimate=${estimateUnits}`);
+        expect(estimateUnits).to.be.gte(shipGas + claimGas);
       }
     });
   });

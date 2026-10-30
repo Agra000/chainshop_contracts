@@ -1,11 +1,16 @@
 // Utilitas admin. Jalankan dengan wallet yang punya ADMIN_ROLE (DEPLOYER_PRIVATE_KEY).
 //
+//   ACTION=info                                npx hardhat run scripts/admin-tools.js --network sepolia
+//   ACTION=grant-operator WALLET=0x...         npx hardhat run scripts/admin-tools.js --network sepolia
+//   ACTION=revoke-operator WALLET=0x...        npx hardhat run scripts/admin-tools.js --network sepolia
 //   ACTION=grant-admin WALLET=0x...            npx hardhat run scripts/admin-tools.js --network sepolia
 //   ACTION=revoke-admin WALLET=0x...           npx hardhat run scripts/admin-tools.js --network sepolia
 //   ACTION=demo-windows MINUTES=5              npx hardhat run scripts/admin-tools.js --network sepolia
 //   ACTION=default-windows                     npx hardhat run scripts/admin-tools.js --network sepolia
 //   ACTION=mint WALLET=0x... AMOUNT=50000      npx hardhat run scripts/admin-tools.js --network sepolia
-//   ACTION=info                                npx hardhat run scripts/admin-tools.js --network sepolia
+//
+// Catatan: timer buyer (3 hari), retur, dan refund diatur di BACKEND (appsettings "Blockchain:*Minutes").
+// Contract hanya menyimpan batas seller kirim + pintu darurat klaim seller.
 const fs = require("fs");
 const path = require("path");
 const hre = require("hardhat");
@@ -18,10 +23,19 @@ async function main() {
   const escrow = await ethers.getContractAt("ChainShopEscrow", deployment.escrow);
   const token = await ethers.getContractAt("MockUSDT", deployment.mockUsdt);
   const ADMIN_ROLE = await escrow.ADMIN_ROLE();
+  const OPERATOR_ROLE = await escrow.OPERATOR_ROLE();
   const action = process.env.ACTION || "info";
   const DAY = 24 * 60 * 60;
 
   switch (action) {
+    case "grant-operator":
+      await (await escrow.grantRole(OPERATOR_ROLE, process.env.WALLET)).wait();
+      console.log(`OPERATOR_ROLE diberikan ke ${process.env.WALLET}`);
+      break;
+    case "revoke-operator":
+      await (await escrow.revokeRole(OPERATOR_ROLE, process.env.WALLET)).wait();
+      console.log(`OPERATOR_ROLE dicabut dari ${process.env.WALLET}`);
+      break;
     case "grant-admin":
       await (await escrow.grantRole(ADMIN_ROLE, process.env.WALLET)).wait();
       console.log(`ADMIN_ROLE diberikan ke ${process.env.WALLET}`);
@@ -31,15 +45,15 @@ async function main() {
       console.log(`ADMIN_ROLE dicabut dari ${process.env.WALLET}`);
       break;
     case "demo-windows": {
-      // semua batas waktu dipersingkat untuk demo (default 5 menit, "tak sampai" 2x lipat)
+      // batas seller kirim dipersingkat untuk demo; pintu darurat klaim seller 6x lipat
       const m = BigInt(process.env.MINUTES || 5) * 60n;
-      await (await escrow.setWindows(m, m, m, m, m * 2n)).wait();
-      console.log(`Batas waktu diset ${m / 60n} menit (barang tak sampai: ${(m * 2n) / 60n} menit)`);
+      await (await escrow.setWindows(m, m * 6n)).wait();
+      console.log(`Batas seller kirim ${m / 60n} menit, klaim darurat seller ${(m * 6n) / 60n} menit`);
       break;
     }
     case "default-windows":
-      await (await escrow.setWindows(3 * DAY, 3 * DAY, 3 * DAY, 3 * DAY, 7 * DAY)).wait();
-      console.log("Batas waktu dikembalikan ke 3 hari (barang tak sampai: 7 hari)");
+      await (await escrow.setWindows(3 * DAY, 30 * DAY)).wait();
+      console.log("Batas seller kirim 3 hari, klaim darurat seller 30 hari");
       break;
     case "mint": {
       const amount = ethers.parseUnits(process.env.AMOUNT || "10000", 6);
@@ -52,11 +66,10 @@ async function main() {
       console.log({
         escrow: deployment.escrow,
         mockUsdt: deployment.mockUsdt,
+        operator: deployment.operator,
+        operatorHasRole: deployment.operator ? await escrow.hasRole(OPERATOR_ROLE, deployment.operator) : false,
         sellerShipWindow: fmt(await escrow.sellerShipWindow()),
-        buyerConfirmWindow: fmt(await escrow.buyerConfirmWindow()),
-        returnShipWindow: fmt(await escrow.returnShipWindow()),
-        returnConfirmWindow: fmt(await escrow.returnConfirmWindow()),
-        notDeliveredWindow: fmt(await escrow.notDeliveredWindow()),
+        sellerClaimWindow: fmt(await escrow.sellerClaimWindow()),
         gasFeeFor1Item: ethers.formatUnits(await escrow.quoteGasFee(1), 6) + " mUSDT",
         gasFeeFor5Items: ethers.formatUnits(await escrow.quoteGasFee(5), 6) + " mUSDT",
         paused: await escrow.paused(),
